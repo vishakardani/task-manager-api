@@ -1,9 +1,12 @@
 require('dotenv').config(); // Must be at the very top
 const express = require('express');
 const mongoose = require('mongoose');
+const cors = require('cors');
 const Task = require('./models/Task'); // Import our new schema
 
 const app = express();
+
+app.use(cors());
 app.use(express.json());
 
 // ==========================================
