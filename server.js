@@ -2,6 +2,7 @@ require('dotenv').config(); // Must be at the very top
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const NodeCache = require('node-cache'); // Import node-cache
 const Task = require('./models/Task'); 
 const bcrypt = require('bcryptjs');
 const User = require('./models/User');
@@ -11,6 +12,12 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Initialize node-cache with a 60-second Time-To-Live (TTL)
+const taskCache = new NodeCache({ stdTTL: 60 });
+
+// Debug tracking for cache performance
+let cacheStats = { hits: 0, misses: 0 };
 
 // ==========================================
 // 1. DATABASE CONNECTION
@@ -105,7 +112,7 @@ app.post('/login', async (req, res, next) => {
 });
 
 // ==========================================
-// 3.5 AUTHENTICATION MIDDLEWARE (The Bouncer)
+// 3.5 AUTHENTICATION MIDDLEWARE
 // ==========================================
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -126,43 +133,76 @@ const authMiddleware = (req, res, next) => {
 };
 
 // ==========================================
-// 4. REST API ROUTES (CRUD via Mongoose)
+// 4. REST API ROUTES (With In-Memory Caching)
 // ==========================================
 
-// READ ALL: Get all tasks (GET /tasks) - PROTECTED
+// READ ALL: Get all tasks (GET /tasks) - CACHED
 app.get('/tasks', authMiddleware, async (req, res, next) => {
   try {
+    const cachedTasks = taskCache.get('all_tasks');
+
+    if (cachedTasks) {
+      cacheStats.hits++;
+      console.log('Cache HIT: Returning all tasks from node-cache');
+      return res.status(200).json(cachedTasks);
+    }
+
+    cacheStats.misses++;
+    console.log('Cache MISS: Fetching all tasks from MongoDB');
     const tasks = await Task.find();
+
+    // Store fetched tasks in cache
+    taskCache.set('all_tasks', tasks);
     res.status(200).json(tasks);
   } catch (err) {
     next(err); 
   }
 });
 
-// READ ONE: Supplementary GET /tasks/:id endpoint - PROTECTED
+// READ ONE: Single task endpoint (GET /tasks/:id) - CACHED
 app.get('/tasks/:id', authMiddleware, validateObjectId, async (req, res, next) => {
   try {
+    const cacheKey = `task_${req.params.id}`;
+    const cachedTask = taskCache.get(cacheKey);
+
+    if (cachedTask) {
+      cacheStats.hits++;
+      console.log(`Cache HIT: Returning task ${req.params.id} from node-cache`);
+      return res.status(200).json(cachedTask);
+    }
+
+    cacheStats.misses++;
+    console.log(`Cache MISS: Fetching task ${req.params.id} from MongoDB`);
     const task = await Task.findById(req.params.id);
+
     if (!task) {
       return res.status(404).json({ error: 'Task not found' });
     }
+
+    // Store fetched task in cache
+    taskCache.set(cacheKey, task);
     res.status(200).json(task);
   } catch (err) {
     next(err);
   }
 });
 
-// CREATE: Add a new task (POST /tasks) - PROTECTED
+// CREATE: Add a new task (POST /tasks) - INVALIDATES CACHE
 app.post('/tasks', authMiddleware, async (req, res, next) => {
   try {
-    const newTask = await Task.create(req.body); 
+    const newTask = await Task.create(req.body);
+
+    // Invalidate main list cache so fresh data is loaded on next GET
+    taskCache.del('all_tasks');
+    console.log('Cache INVALIDATED: "all_tasks" key deleted due to POST');
+
     res.status(201).json(newTask);
   } catch (err) {
     next(err);
   }
 });
 
-// UPDATE: Modify a task (PUT /tasks/:id) - PROTECTED
+// UPDATE: Modify a task (PUT /tasks/:id) - INVALIDATES CACHE
 app.put('/tasks/:id', authMiddleware, validateObjectId, async (req, res, next) => {
   try {
     const updatedTask = await Task.findByIdAndUpdate(req.params.id, req.body, { 
@@ -173,19 +213,31 @@ app.put('/tasks/:id', authMiddleware, validateObjectId, async (req, res, next) =
     if (!updatedTask) {
       return res.status(404).json({ error: 'Task not found' });
     }
+
+    // Invalidate both main list and specific item cache
+    taskCache.del('all_tasks');
+    taskCache.del(`task_${req.params.id}`);
+    console.log(`Cache INVALIDATED: Keys deleted due to PUT on task ${req.params.id}`);
+
     res.status(200).json(updatedTask);
   } catch (err) {
     next(err);
   }
 });
 
-// DELETE: Remove a task (DELETE /tasks/:id) - PROTECTED
+// DELETE: Remove a task (DELETE /tasks/:id) - INVALIDATES CACHE
 app.delete('/tasks/:id', authMiddleware, validateObjectId, async (req, res, next) => {
   try {
     const deletedTask = await Task.findByIdAndDelete(req.params.id);
     if (!deletedTask) {
       return res.status(404).json({ error: 'Task not found' });
     }
+
+    // Invalidate both main list and specific item cache
+    taskCache.del('all_tasks');
+    taskCache.del(`task_${req.params.id}`);
+    console.log(`Cache INVALIDATED: Keys deleted due to DELETE on task ${req.params.id}`);
+
     res.status(200).json({ message: 'Task deleted successfully' });
   } catch (err) {
     next(err);
@@ -193,7 +245,18 @@ app.delete('/tasks/:id', authMiddleware, validateObjectId, async (req, res, next
 });
 
 // ==========================================
-// 5. ERROR HANDLING PIPELINE
+// 5. DEBUG ENDPOINT FOR CACHE STATS
+// ==========================================
+app.get('/cache/stats', (req, res) => {
+  res.status(200).json({
+    statistics: cacheStats,
+    cachedKeys: taskCache.keys(),
+    ttlSeconds: 60
+  });
+});
+
+// ==========================================
+// 6. ERROR HANDLING PIPELINE
 // ==========================================
 
 app.use((req, res, next) => {
